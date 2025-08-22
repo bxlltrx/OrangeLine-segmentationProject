@@ -1,152 +1,240 @@
 import streamlit as st
 from PIL import Image
 import cv2
+import io
 import numpy as np
 import torch
 import albumentations as albu
-from albumentations.pytorch import ToTensorV2
 
-# Определение классов и размеров изображения
-CLASSES = ["фон", "волосы", "кожа"]
+# -----------------------------
+# Настройки
+# -----------------------------
+CLASSES = ["фон", "линия"]
 INFER_WIDTH = 256
 INFER_HEIGHT = 256
-
-# Статистика нормализации для ImageNet
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+MODEL_PATH = "models/best_model_new.pt"   # <-- путь к одной модели
 
-# Определение устройства для вычислений
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Загрузка JIT модели
-best_model = torch.jit.load('models/best_model_new.pt', map_location=DEVICE)
+def compute_metrics(pred_mask: np.ndarray, true_mask: np.ndarray, class_index: int = 1):
+    """
+    Вычисление метрик для бинарной сегментации (по выбранному классу).
+    pred_mask, true_mask: 2D numpy arrays (H, W), значения {0,1,...}
+    """
+    pred = (pred_mask == class_index).astype(np.uint8)
+    true = (true_mask == class_index).astype(np.uint8)
 
+    intersection = np.logical_and(pred, true).sum()
+    union = np.logical_or(pred, true).sum()
 
+    dice = (2 * intersection) / (pred.sum() + true.sum() + 1e-7)
+    iou = intersection / (union + 1e-7)
+    acc = (pred == true).mean()
+
+    return {
+        "IoU": round(float(iou), 4),
+        "Dice": round(float(dice), 4),
+        "Accuracy": round(float(acc), 4),
+    }
+
+def to_bytes(img: np.ndarray) -> bytes:
+    """Конвертирует numpy-изображение в PNG-байты для st.download_button."""
+    pil_img = Image.fromarray(img)
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return buf.getvalue()
+
+# -----------------------------
+# Кэш: модель и аугментации
+# -----------------------------
+@st.cache_resource
+def load_model(path: str):
+    model = torch.jit.load(path, map_location=DEVICE)
+    model.eval()
+    return model
+
+@st.cache_data
 def get_validation_augmentation():
-    """Получить аугментации для валидации."""
-    test_transform = [
+    return albu.Compose([
         albu.LongestMaxSize(max_size=INFER_HEIGHT, always_apply=True),
         albu.PadIfNeeded(min_height=INFER_HEIGHT, min_width=INFER_WIDTH, always_apply=True),
         albu.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-    ]
-    return albu.Compose(test_transform)
+    ])
 
-
-def infer_image(image):
-    """Получить маску на изображении с помощью модели Unet."""
+# -----------------------------
+# Инференс
+# -----------------------------
+def infer_image_with_model(image: np.ndarray, model: torch.nn.Module):
     original_height, original_width, _ = image.shape
-
-    # Применение аугментаций
     augmentation = get_validation_augmentation()
     augmented = augmentation(image=image)
-    image_transformed = augmented['image']
+    image_transformed = augmented["image"]
 
-    # Преобразование изображения в PyTorch тензор и перемещение на устройство
-    x_tensor = torch.from_numpy(image_transformed).to(DEVICE).unsqueeze(0).permute(0, 3, 1, 2).float()
-
-    # Прогон изображения через модель
-    best_model.eval()
-    with torch.no_grad():
-        pr_mask = best_model(x_tensor)
-
-    # Преобразование вывода в массив numpy и удаление размерности пакета
-    pr_mask = pr_mask.squeeze().cpu().detach().numpy()
-
-    # Получение класса с наивысшей вероятностью для каждого пикселя
-    label_mask = np.argmax(pr_mask, axis=0)
-
-    # Определение количества пикселей, которые будут появляться по бокам от паддингов, и их обрезка
-    if original_height > original_width:
-        delta_pixels = int(((original_height - original_width) / 2) / original_height * INFER_HEIGHT)
-        image_cropped = image_transformed[:, delta_pixels + 1: INFER_WIDTH - delta_pixels - 1]
-        mask_cropped = label_mask[:, delta_pixels + 1: INFER_WIDTH - delta_pixels - 1]
-    elif original_height < original_width:
-        delta_pixels = int(((original_width - original_height) / 2) / original_width * INFER_WIDTH)
-        image_cropped = image_transformed[delta_pixels + 1: INFER_HEIGHT - delta_pixels - 1, :]
-        mask_cropped = label_mask[delta_pixels + 1: INFER_HEIGHT - delta_pixels - 1, :]
-    else:
-        mask_cropped = label_mask
-        image_cropped = image_transformed
-
-    # Изменение размера маски обратно к исходному размеру изображения
-    label_mask_real_size = cv2.resize(
-        mask_cropped, (original_width, original_height), interpolation=cv2.INTER_NEAREST
+    x_tensor = (
+        torch.from_numpy(image_transformed)
+        .to(DEVICE)
+        .unsqueeze(0)
+        .permute(0, 3, 1, 2)
+        .float()
     )
 
-    return label_mask_real_size
+    with torch.no_grad():
+        pr = model(x_tensor)
 
+    pr = pr.squeeze().cpu().numpy()          # (C, H, W)
+    label_mask = np.argmax(pr, axis=0)       # (H, W)
 
-def adjust_hsv(image, mask, h_adjust, s_adjust, v_adjust, index):
-    """Корректировка значения HSV на изображении в области, где mask == index."""
-    # Преобразование изображения в HSV
-    image_hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
-    h, s, v = cv2.split(image_hsv)
+    # Убираем паддинги от квадратного пайплайна
+    if original_height > original_width:
+        delta = int(((original_height - original_width) / 2) / original_height * INFER_HEIGHT)
+        mask_cropped = label_mask[:, delta: INFER_WIDTH - delta]
+    elif original_height < original_width:
+        delta = int(((original_width - original_height) / 2) / original_width * INFER_WIDTH)
+        mask_cropped = label_mask[delta: INFER_HEIGHT - delta, :]
+    else:
+        mask_cropped = label_mask
 
-    # Применение корректировок только к области, где mask == index
-    h[mask == index] = np.clip(h[mask == index] + h_adjust, 0, 179)
-    s[mask == index] = np.clip(s[mask == index] + s_adjust, 0, 255)
-    v[mask == index] = np.clip(v[mask == index] + v_adjust, 0, 255)
+    mask_real = cv2.resize(mask_cropped, (original_width, original_height), interpolation=cv2.INTER_NEAREST)
+    return mask_real
 
-    # Объединение каналов HSV обратно в одно изображение
-    image_hsv_adjusted = cv2.merge([h, s, v])
+# -----------------------------
+# Вспомогательные функции UI/обработки
+# -----------------------------
+def overlay_mask(img_rgb: np.ndarray, mask: np.ndarray, alpha: float = 0.45):
+    """Полупрозрачный оверлей предсказанной маски."""
+    img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    # Подсветим класс "линия" (index=1) цветом
+    color = (0, 255, 255)  # желтый в BGR
+    overlay = img_bgr.copy()
+    overlay[mask == 1] = (overlay[mask == 1] * (1 - alpha) + np.array(color) * alpha).astype(np.uint8)
+    out = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+    return out
 
-    # Преобразование изображения обратно в RGB для отображения
-    image_rgb_adjusted = cv2.cvtColor(image_hsv_adjusted.astype(np.uint8), cv2.COLOR_HSV2RGB)
+def adjust_hsv(image: np.ndarray, mask: np.ndarray, h_adjust: int, s_adjust: int, v_adjust: int, index: int):
+    """Корректировка HSV в области mask == index."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV).astype(np.float32)
+    h, s, v = cv2.split(hsv)
 
-    return image_rgb_adjusted
+    m = (mask == index)
+    h[m] = np.clip(h[m] + h_adjust, 0, 179)
+    s[m] = np.clip(s[m] + s_adjust, 0, 255)
+    v[m] = np.clip(v[m] + v_adjust, 0, 255)
 
+    out = cv2.merge([h, s, v]).astype(np.uint8)
+    return cv2.cvtColor(out, cv2.COLOR_HSV2RGB)
 
-def display_image(image):
-    """Отображение изображения."""
-    st.image(image, use_column_width=True)
+def to_pil(img: np.ndarray) -> Image.Image:
+    return Image.fromarray(img)
 
-
-def upload_image(label):
-    """Загрузка изображения."""
-    uploaded_file = st.file_uploader(label, type=['jpg', 'png', 'jpeg'])
-    if uploaded_file is not None:
-        image_data = np.array(Image.open(uploaded_file))
-        return image_data
-    return None
-
-
+# -----------------------------
+# UI
+# -----------------------------
 def main():
-    st.set_page_config(
-        page_title="Обрабочик изображений",
-        page_icon='🎨',
-        layout="wide",
-        initial_sidebar_state="expanded", )
+    st.set_page_config(page_title="Line Segmentation", page_icon="🧠", layout="wide")
 
-    st.title('Инструмент корректировки изображений')
+    # Ограничиваем высоту всех изображений высотой окна, тянем на всю ширину
+    st.markdown("""
+        <style>
+        .stImage img {
+            width: 100% !important;      /* растягиваем по ширине контейнера */
+            height: auto !important;      /* сохраняем пропорции */
+            max-height: 85vh !important;  /* не выше 85% высоты экрана */
+            object-fit: contain !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    st.title("🧠 Line Segmentation")
+    st.caption("DeepLabV3+")
+
+    with st.sidebar:
+        st.subheader("Параметры")
+        st.markdown("**Модель:**")
+        st.code(MODEL_PATH, language="text")
+        alpha = st.slider("Прозрачность маски", 0.0, 1.0, 0.45, 0.05)
+
+        st.markdown("---")
+        st.subheader("HSV-коррекция")
+        h_adjust = st.slider("Оттенок (H)", -179, 179, 0)
+        s_adjust = st.slider("Насыщенность (S)", -255, 255, 0)
+        v_adjust = st.slider("Яркость (V)", -255, 255, 0)
+        region = st.selectbox("Область", CLASSES)
+        index = CLASSES.index(region)
+
+        st.markdown("---")
+        st.info("Загрузите изображение в формате JPG/PNG. Маска подсвечивает класс «линия».", icon="ℹ️")
+
+    st.markdown("---")
+    st.subheader("Масштабирование")
+    scale_percent = st.slider("Масштаб изображения (%)", 10, 100, 50, 5)
+
+    def resize_img(img: np.ndarray, scale: int) -> np.ndarray:
+        """Масштабирование изображения по процентам."""
+        h, w = img.shape[:2]
+        new_w = int(w * scale / 100)
+        new_h = int(h * scale / 100)
+        return cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+    # Загрузка модели (кэшир.)
+    model = load_model(MODEL_PATH)
 
     # Загрузка изображения
-    image = upload_image('Загрузите изображение')
+    uploaded = st.file_uploader("Загрузите изображение", type=["jpg", "jpeg", "png"])
+    if uploaded is None:
+        st.stop()
 
-    # Проверка, что изображение загружено
-    if image is not None:
-        # Выбор значений для корректировки HSV
-        h_adjust = st.sidebar.slider('Корректировка оттенка (H) (-179 до 179)', -179, 179, 0)
-        s_adjust = st.sidebar.slider('Корректировка насыщенности (S) (-255 до 255)', -255, 255, 0)
-        v_adjust = st.sidebar.slider('Корректировка освещения (V) (-255 до 255)', -255, 255, 0)
+    image = np.array(Image.open(uploaded).convert("RGB"))
 
-        # Выбор значения для изменения в маске с помощью выпадающего списка
-        mask_value = st.sidebar.selectbox('Выберите интересующую область', CLASSES)
+    # Инференс
+    mask = infer_image_with_model(image, model)
 
-        # Ищем индекс значения в списке
-        index = CLASSES.index(mask_value)
+    # --- ВКЛАДКИ И ОТРИСОВКА ---
+    tab1, tab2, tab3 = st.tabs(["🖼️ Оригинал", "🎯 Маска", "🎛️ Результат (HSV)"])
 
-        mask = infer_image(image)
+    # --- TAB 1: Оригинал ---
+    with tab1:
+        img_small = resize_img(image, scale_percent)
+        st.image(img_small, caption="Оригинал", use_container_width=True)
+        st.download_button(
+            "Скачать исходное изображение",
+            data=to_bytes(img_small),
+            file_name="original_small.png",
+            mime="image/png"
+        )
 
-        # Применение корректировок HSV
-        adjusted_image = adjust_hsv(image, mask, h_adjust, s_adjust, v_adjust, index)
+    # --- TAB 2: Маска ---
+    with tab2:
+        col1, col2 = st.columns([2, 1])  # слева пошире
+        overlay = overlay_mask(image, mask, alpha=alpha)
+        mask_vis = (mask == 1).astype(np.uint8) * 255
 
-        # Отображение исходного изображения и скорректированного изображения в двух столбцах
-        col1, col2, _ = st.columns(3)
         with col1:
-            display_image(image)
+            st.image(overlay, caption="Оверлей маски (класс «линия»)", use_container_width=True)
+
         with col2:
-            display_image(adjusted_image)
+            st.image(mask_vis, caption="Маска (линия)", use_container_width=True)
 
+        st.download_button(
+            "Скачать маску (линия)",
+            data=to_bytes(np.stack([mask_vis] * 3, axis=-1)),
+            file_name="mask_line.png",
+            mime="image/png"
+        )
+    # --- TAB 3: Результат ---
+    with tab3:
+        adjusted = adjust_hsv(image, mask, h_adjust, s_adjust, v_adjust, index)
+        adjusted_small = resize_img(adjusted, scale_percent)
+        st.image(adjusted_small, caption=f"HSV-коррекция — {CLASSES[index]}", use_container_width=True)
 
-if __name__ == '__main__':
+        st.download_button(
+            "💾 Скачать результат",
+            data=to_bytes(adjusted_small),
+            file_name="adjusted_small.png",
+            mime="image/png"
+        )
+
+if __name__ == "__main__":
     main()
+>>>>>>> master
